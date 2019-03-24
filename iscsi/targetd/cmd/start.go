@@ -17,8 +17,6 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/kubernetes-incubator/external-storage/iscsi/targetd/provisioner"
 	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
 	"github.com/sirupsen/logrus"
@@ -73,11 +71,7 @@ var startcontrollerCmd = &cobra.Command{
 			log.Fatalf("Error getting server version: %v", err)
 		}
 
-		url := fmt.Sprintf("%s://%s:%s@%s:%d/targetrpc", viper.GetString("targetd-scheme"), viper.GetString("targetd-username"), viper.GetString("targetd-password"), viper.GetString("targetd-address"), viper.GetInt("targetd-port"))
-
-		log.Debugln("targed URL", url)
-
-		iscsiProvisioner := provisioner.NewiscsiProvisioner(url)
+		iscsiProvisioner := provisioner.NewiscsiProvisioner(kubernetesClientSet)
 		log.Debugln("iscsi provisioner created")
 
 		pc := controller.NewProvisionController(kubernetesClientSet, viper.GetString("provisioner-name"), iscsiProvisioner, serverVersion.GitVersion, controller.Threadiness(1))

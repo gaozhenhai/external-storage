@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tenx-iscsi1-secret
+  namespace: kube-system
+type: "kubernetes.io/iscsi-chap"
+stringData:
+  credential: |-
+    target.auth.username: admin
+    target.auth.password: dreamx
+    node.session.auth.username: test1
+    node.session.auth.password: aaaaaa
+    node.session.auth.username_in: test2
+    node.session.auth.password_in: bbbbbb
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: tenx-iscsi1
+provisioner: iscsi-targetd
+parameters:
+  targetPortal: 192.168.1.241:3260
+  iqn: iqn.2019-03.com.tenxcloud.k8s:241
+  volumeGroup: vg-target
+  initiators: iqn.2019-03.com.tenxcloud.k8s:client
+  chapAuthDiscovery: "true"
+  chapAuthSession: "true"  
+  secretName: tenx-iscsi1-secret

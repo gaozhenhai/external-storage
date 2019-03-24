@@ -29,17 +29,24 @@ import (
 	"github.com/powerman/rpc-codec/jsonrpc2"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+)
+
+const (
+	NAMESPACE = "kube-system"
 )
 
 var log = logrus.New()
 
 type chapSessionCredentials struct {
-	InUser      string `properties:"node.session.auth.username"`
-	InPassword  string `properties:"node.session.auth.password"`
-	OutUser     string `properties:"node.session.auth.username_in"`
-	OutPassword string `properties:"node.session.auth.password_in"`
+	InUser      string `properties:"node.session.auth.username,default=' '"`
+	InPassword  string `properties:"node.session.auth.password,default=' '"`
+	OutUser     string `properties:"node.session.auth.username_in,default=' '"`
+	OutPassword string `properties:"node.session.auth.password_in,default=' '"`
+	Username    string `properties:"target.auth.username"`
+	Password    string `properties:"target.auth.password"`
 }
 
 type volCreateArgs struct {
@@ -76,7 +83,9 @@ type exportDestroyArgs struct {
 }
 
 type iscsiProvisioner struct {
-	targetdURL string
+	targetdURL      string
+	clientSet       kubernetes.Interface
+	chapCredentials *chapSessionCredentials
 }
 
 type export struct {
@@ -91,12 +100,13 @@ type export struct {
 type exportList []export
 
 // NewiscsiProvisioner creates new iscsi provisioner
-func NewiscsiProvisioner(url string) controller.Provisioner {
+func NewiscsiProvisioner(clientSet kubernetes.Interface) controller.Provisioner {
 
 	initLog()
 
 	return &iscsiProvisioner{
-		targetdURL: url,
+		clientSet:       clientSet,
+		chapCredentials: &chapSessionCredentials{},
 	}
 }
 
@@ -125,6 +135,13 @@ func (p *iscsiProvisioner) Provision(options controller.VolumeOptions) (*v1.Pers
 	annotations["volume_name"] = vol
 	annotations["pool"] = pool
 	annotations["initiators"] = options.Parameters["initiators"]
+	annotations["secret_name"] = options.Parameters["secretName"]
+	fsType, _ := options.PVC.Labels["system/fsType"]
+
+	var initiatorNames *string = nil
+	if initiators, ok := options.Parameters["initiators"]; ok {
+		initiatorNames = &initiators
+	}
 
 	var portals []string
 	if len(options.Parameters["portals"]) > 0 {
@@ -153,10 +170,18 @@ func (p *iscsiProvisioner) Provision(options controller.VolumeOptions) (*v1.Pers
 					ISCSIInterface:    options.Parameters["iscsiInterface"],
 					Lun:               lun,
 					ReadOnly:          getReadOnly(options.Parameters["readonly"]),
-					FSType:            getFsType(options.Parameters["fsType"]),
+					FSType:            getFsType(fsType),
 					DiscoveryCHAPAuth: getBool(options.Parameters["chapAuthDiscovery"]),
 					SessionCHAPAuth:   getBool(options.Parameters["chapAuthSession"]),
-					SecretRef:         getSecretRef(getBool(options.Parameters["chapAuthDiscovery"]), getBool(options.Parameters["chapAuthSession"]), &v1.SecretReference{Name: viper.GetString("provisioner-name") + "-chap-secret"}),
+					InitiatorName:     initiatorNames,
+					SecretRef: getSecretRef(
+						getBool(options.Parameters["chapAuthDiscovery"]),
+						getBool(options.Parameters["chapAuthSession"]),
+						&v1.SecretReference{
+							Name:      options.Parameters["secretName"],
+							Namespace: NAMESPACE,
+						},
+					),
 				},
 			},
 		},
@@ -198,6 +223,11 @@ func getBool(value string) bool {
 // Delete removes the storage asset that was created by Provision represented
 // by the given PV.
 func (p *iscsiProvisioner) Delete(volume *v1.PersistentVolume) error {
+	if err := p.initTargetUrlAndSecret(volume.Annotations["secret_name"], volume.Spec.ISCSI.TargetPortal); err != nil {
+		log.Warnln(err)
+		return err
+	}
+
 	//vol from the annotation
 	log.Debugln("volume deletion request received: ", volume.GetName())
 	for _, initiator := range strings.Split(volume.Annotations["initiators"], ",") {
@@ -228,24 +258,35 @@ func initLog() {
 	}
 }
 
+func (p *iscsiProvisioner) initTargetUrlAndSecret(secretName, targetPortal string) error {
+	secret, err := p.clientSet.CoreV1().Secrets(NAMESPACE).Get(secretName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	prop, err := properties.Load(secret.Data["credential"], properties.UTF8)
+	if err != nil {
+		return err
+	}
+
+	if err := prop.Decode(p.chapCredentials); err != nil {
+		return err
+	}
+
+	address := strings.Split(targetPortal, ":")[0]
+	p.targetdURL = fmt.Sprintf("%s://%s:%s@%s:%d/targetrpc", viper.GetString("targetd-scheme"), p.chapCredentials.Username, p.chapCredentials.Password, address, viper.GetInt("targetd-port"))
+	return nil
+}
+
 func (p *iscsiProvisioner) createVolume(options controller.VolumeOptions) (vol string, lun int32, pool string, err error) {
 	size := getSize(options)
 	vol = p.getVolumeName(options)
 	pool = p.getVolumeGroup(options)
 	initiators := p.getInitiators(options)
-	chapCredentials := &chapSessionCredentials{}
-	//read chap session authentication credentials
-	if getBool(options.Parameters["chapAuthSession"]) {
-		prop, err2 := properties.LoadFile(viper.GetString("session-chap-credential-file-path"), properties.UTF8)
-		if err2 != nil {
-			log.Warnln(err2)
-			return "", 0, "", err2
-		}
-		err2 = prop.Decode(chapCredentials)
-		if err2 != nil {
-			log.Warnln(err2)
-			return "", 0, "", err2
-		}
+
+	if err := p.initTargetUrlAndSecret(options.Parameters["secretName"], options.Parameters["targetPortal"]); err != nil {
+		log.Warnln(err)
+		return "", 0, "", err
 	}
 
 	log.Debugln("calling export_list")
@@ -276,13 +317,13 @@ func (p *iscsiProvisioner) createVolume(options controller.VolumeOptions) (vol s
 		}
 		log.Debugln("exported volume name, lun, pool, initiator ", vol, lun, pool, initiator)
 		if getBool(options.Parameters["chapAuthSession"]) {
-			log.Debugln("setting up chap session auth for initiator, initiator, in_user, out_user: ", initiator, chapCredentials.InUser, chapCredentials.OutUser)
-			err = p.setInitiatorAuth(initiator, chapCredentials.InUser, chapCredentials.InPassword, chapCredentials.OutUser, chapCredentials.OutPassword)
+			log.Debugln("setting up chap session auth for initiator, initiator, in_user, out_user: ", initiator, p.chapCredentials.InUser, p.chapCredentials.OutUser)
+			err = p.setInitiatorAuth(initiator, p.chapCredentials.InUser, p.chapCredentials.InPassword, p.chapCredentials.OutUser, p.chapCredentials.OutPassword)
 			if err != nil {
 				log.Warnln(err)
 				return "", 0, "", err
 			}
-			log.Debugln("set up chap session auth for initiator, initiator, in_user, out_user: ", initiator, chapCredentials.InUser, chapCredentials.OutUser)
+			log.Debugln("set up chap session auth for initiator, initiator, in_user, out_user: ", initiator, p.chapCredentials.InUser, p.chapCredentials.OutUser)
 		}
 	}
 	return vol, lun, pool, nil
